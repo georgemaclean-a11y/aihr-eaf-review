@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>AIHR EAF Chat Review</title>
+    <meta name="description" content="Paste a Help Scout link or transcript and score it against AIHR's EAF rubric."/>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React / ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for in-browser JSX transpile (simple static hosting) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Recharts (UMD) -->
+    <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+    <!-- SheetJS (XLSX) -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <style>
+      body { background: linear-gradient(to bottom, #f8fafc, #f1f5f9); }
+      .card { background:#fff; border-radius:16px; box-shadow:0 10px 25px rgba(16,24,40,.08); }
+    </style>
+  </head>
+  <body class="text-slate-900">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useMemo } = React;
+      const { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } = Recharts;
+
+      // --- Rubric ---
+      const DEFAULT_RUBRIC = {
+        Core: [
+          { label: "Customer Experience First", weight: 1, description: "Takes ownership; smooth, supportive, solution-focused.", group: "Both" },
+          { label: "Clarity & Conciseness", weight: 1, description: "Simple, jargon-free, direct, transparent.", group: "Both" },
+          { label: "Proactive Problem-Solving", weight: 1, description: "Anticipates concerns; aims for first-contact resolution.", group: "Both" },
+          { label: "Empathy", weight: 1, description: "Acknowledges concerns; validates feelings before solutions.", group: "Both" },
+          { label: "Consistency Across Channels", weight: 0.5, description: "Maintains tone/quality regardless of channel.", group: "Both" },
+        ],
+        Support: [
+          { label: "Clarity", weight: 1, description: "Clear, easy-to-understand explanations; good formatting.", group: "Support" },
+          { label: "Accuracy", weight: 1, description: "Up-to-date, factual, relevant info.", group: "Support" },
+          { label: "Problem-solving", weight: 1, description: "Complete, actionable solution with next steps.", group: "Support" },
+          { label: "Tone", weight: 1, description: "Friendly, professional, aligned with brand.", group: "Support" },
+          { label: "Fullness", weight: 1, description: "Addresses full issue in first response, with context.", group: "Support" },
+        ],
+        Admissions: [
+          { label: "Discovery", weight: 1, description: "Probes needs/background to recommend appropriately.", group: "Admissions" },
+          { label: "Fullness", weight: 1, description: "Answers all questions & anticipates follow-ups.", group: "Admissions" },
+          { label: "Clarity", weight: 1, description: "Clear, structured answers; avoids jargon.", group: "Admissions" },
+          { label: "Accuracy", weight: 1, description: "Current, correct program info & policies.", group: "Admissions" },
+          { label: "Tone", weight: 1, description: "Personable, professional, consultative.", group: "Admissions" },
+        ],
+        Writing: [
+          { label: "Formatting & Grammar", weight: 0.5, description: "Sentence case, spacing, punctuation; Oxford comma; em dashes; avoid overusing ellipses.", group: "Both" },
+        ],
+      };
+
+      function buildCriteria(reviewType) {
+        const core = DEFAULT_RUBRIC.Core.filter(c => c.group === "Both");
+        const writing = DEFAULT_RUBRIC.Writing.filter(c => c.group === "Both");
+        const specific = DEFAULT_RUBRIC[reviewType];
+        return [...core, ...specific, ...writing].map(c => ({ ...c }));
+      }
+
+      const SETTINGS_KEY = "aihr-eaf-settings";
+
+      function useSettings() {
+        const [useApi, setUseApi]   = useState(false);
+        const [apiPath, setApiPath] = useState("/api/review");
+        const [shareBase, setShareBase] = useState("");
+
+        useEffect(() => {
+          const raw = localStorage.getItem(SETTINGS_KEY);
+          if (raw) {
+            try {
+              const j = JSON.parse(raw);
+              setUseApi(!!j.useApi);
+              setApiPath(j.apiPath || "/api/review");
+              setShareBase(j.shareBase || "");
+            } catch {}
+          }
+        }, []);
+        useEffect(() => {
+          localStorage.setItem(SETTINGS_KEY, JSON.stringify({ useApi, apiPath, shareBase }));
+        }, [useApi, apiPath, shareBase]);
+
+        return { useApi, setUseApi, apiPath, setApiPath, shareBase, setShareBase };
+      }
+
+      // Transcript cleaner
+      function cleanTranscript(raw) {
+        if (!raw) return raw;
+        let s = raw;
+        s = s.split('\\n').filter(line => !line.trim().startsWith('>')).join('\\n');
+        const headerStarts = ['From:', 'Sent:', 'To:', 'Subject:'];
+        s = s.split('\\n').filter(line => !headerStarts.some(h => line.trim().startsWith(h))).join('\\n');
+        s = s.split(' ').map(tok => (tok.startsWith('http://') || tok.startsWith('https://')) && tok.length > 60 ? '[link]' : tok).join(' ');
+        ['Kind regards', 'Best regards', 'Best,', 'Thanks,', 'Thank you,'].forEach(tag => {
+          const idx = s.toLowerCase().lastIndexOf(tag.toLowerCase());
+          if (idx > -1 && (s.length - idx) < 400) s = s.slice(0, idx).trim();
+        });
+        while (s.includes('\\n\\n\\n')) s = s.replace('\\n\\n\\n', '\\n\\n');
+        return s.trim();
+      }
+
+      // Mock LLM
+      function mockGrade(input, criteria) {
+        const lower = (input || "").toLowerCase();
+        const hasEmpathy = /(sorry|understand|appreciate|thanks|i can see)/.test(lower);
+        const hasSteps = /(step|first|second|next|i\\'ve|i have|i\\’ve)/.test(lower);
+        const hasSolution = /(i\\'ve .* (fixed|updated|extended|reset|changed)|here\\'s what we\\'ll do|i can do)/.test(lower);
+
+        const base = criteria.map(c => {
+          let s = 3;
+          if (c.label.includes("Empathy")) s = hasEmpathy ? 4.5 : 2.5;
+          if (c.label.toLowerCase().includes("problem") || c.label === "Problem-solving") s = hasSolution ? 4.2 : 2.8;
+          if (c.label === "Fullness") s = hasSteps ? 4.0 : 2.8;
+          if (c.label === "Clarity" || c.label === "Clarity & Conciseness") s = (input || "").length > 40 ? 4.0 : 2.8;
+          if (c.label === "Formatting & Grammar") s = 3.8;
+          return {
+            label: c.label,
+            score: Math.max(0, Math.min(5, s)),
+            rationale: `Assessment for ${c.label} based on message structure, empathy indicators, and actionability.`,
+            quotes: [],
+            suggestions: `Strengthen ${c.label.toLowerCase()} by using bullet points and explicit next steps where applicable.`,
+          };
+        });
+
+        const weighted = base.reduce((acc, cur) => acc + cur.score * 20, 0) / base.length;
+        return {
+          overall: Math.round(weighted),
+          byCriterion: base,
+          suggestedRewrite: `Thanks for your patience—I've extended your access and emailed confirmation. If anything looks off, reply here and I'll fix it right away.`,
+          risks: ["Check for policy alignment before offering exceptions."],
+        };
+      }
+
+      // CSV helper
+      function exportCSVRows(rows, filename) {
+        const csv = rows.map(r => r.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+      }
+
+      // b64 helpers (Unicode-safe)
+      const b64enc = s => btoa(encodeURIComponent(s).replace(/%([0-9A-F]{2})/g, (_m, p) => String.fromCharCode(parseInt(p, 16))));
+      const b64dec = s => decodeURIComponent(Array.from(atob(s)).map(c => '%' + c.charCodeAt(0).toString(16).padStart(2,'0')).join(''));
+
+      function App() {
+        const { useApi, setUseApi, apiPath, setApiPath, shareBase, setShareBase } = useSettings();
+        const [reviewType, setReviewType] = useState("Support");
+        const [text, setText] = useState("");
+        const [link, setLink] = useState("");
+        const [weights, setWeights] = useState({});
+        const [loading, setLoading] = useState(false);
+        const [result, setResult] = useState(null);
+        const [managerNotes, setManagerNotes] = useState("");
+        const [importMessage, setImportMessage] = useState(null);
+        const [calibration, setCalibration] = useState(false);
+        const [reviewerId, setReviewerId] = useState("");
+        const [peerResult, setPeerResult] = useState(null);
+        const [testOutput, setTestOutput] = useState(null);
+
+        const criteria = useMemo(() => buildCriteria(reviewType), [reviewType]);
+        const totalWeight = useMemo(() => criteria.reduce((acc, c) => acc + (weights[c.label] ?? c.weight), 0), [criteria, weights]);
+
+        const calibrationDiff = useMemo(() => {
+          if (!result || !peerResult) return [];
+          const map = new Map();
+          result.byCriterion.forEach(c => map.set(c.label, {...(map.get(c.label)||{}), mine: c.score }));
+          peerResult.byCriterion.forEach(c => map.set(c.label, {...(map.get(c.label)||{}), theirs: c.score }));
+          return Array.from(map.entries()).map(([label, v]) => ({ label, mine: v.mine, theirs: v.theirs, delta: (v.mine!=null && v.theirs!=null) ? Math.abs(v.mine - v.theirs) : undefined }))
+            .sort((a,b)=> (b.delta ?? 0) - (a.delta ?? 0));
+        }, [result, peerResult]);
+
+        async function runReview() {
+          setLoading(true); setResult(null);
+          const activeCriteria = criteria.map(c => ({ label: c.label, description: c.description, weight: weights[c.label] ?? c.weight }));
+          try {
+            if (useApi) {
+              const r = await fetch(apiPath, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text, link, reviewType, criteria: activeCriteria }),
+              });
+              if (!r.ok) throw new Error("API " + r.status);
+              const data = await r.json();
+              setResult(data);
+            } else {
+              const data = mockGrade(text || link, activeCriteria);
+              setResult(data);
+            }
+          } catch (e) {
+            console.warn("Falling back to mock review:", e);
+            const data = mockGrade(text || link, activeCriteria);
+            setResult(data);
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        function exportJSON() {
+          if (!result) return;
+          const payload = { reviewType, reviewerId, text, link, managerNotes, result, timestamp: new Date().toISOString() };
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob); const a = document.createElement("a");
+          a.href = url; a.download = `aihr-eaf-review-${Date.now()}.json`; a.click(); URL.revokeObjectURL(url);
+        }
+
+        function exportCSV() {
+          if (!result) return;
+          const headers = ["timestamp","reviewType","reviewerId","overall","notes", ...result.byCriterion.map(c=>c.label+" (0-5)")];
+          const row = [new Date().toISOString(), reviewType, reviewerId, String(result.overall), managerNotes, ...result.byCriterion.map(c=>String(c.score))];
+          exportCSVRows([headers, row], `aihr-eaf-review-${Date.now()}.csv`);
+        }
+
+        function getShareLink() {
+          if (!result) return "";
+          const payload = { reviewType, reviewerId, managerNotes, result, link };
+          const enc = encodeURIComponent(b64enc(JSON.stringify(payload)));
+          const base = (shareBase && shareBase.trim().length) ? shareBase.trim() : `${window.location.origin}${window.location.pathname}`;
+          const noHash = base.split('#')[0];
+          return `${noHash}#payload=${enc}`;
+        }
+        function makeShareLink() {
+          if (!result) return;
+          const url = getShareLink();
+          navigator.clipboard.writeText(url);
+          alert("Shareable link copied to clipboard.");
+        }
+        function openShareLink() {
+          const url = getShareLink();
+          if (!url) return; window.open(url, "_blank");
+        }
+
+        function exportHTML() {
+          if (!result) return;
+          const payload = { reviewType, reviewerId, managerNotes, result, link, generatedAt: new Date().toISOString() };
+          const escapeHTML = s => String(s).replace(/[<>&]/g, m => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[m]));
+          const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>AIHR EAF Review</title>
+          <style>body{font-family:Inter,system-ui,Arial,sans-serif;background:#f6f7fb;color:#0f172a;padding:24px} .card{background:#fff;border-radius:16px;box-shadow:0 6px 24px rgba(16,24,40,.08);padding:16px;margin-bottom:16px} .pill{display:inline-block;background:#eef2ff;border:1px solid #e0e7ff;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px} .row{display:flex;justify-content:space-between;align-items:flex-end}</style></head><body>
+          <div class="card"><h2>AIHR EAF Review <span class="pill">${payload.reviewType}</span>${payload.reviewerId ? `<span class="pill">Reviewer: ${escapeHTML(payload.reviewerId)}</span>` : ''}</h2>
+          <div class="row"><div><div style="font-size:12px;color:#475569">Overall</div><div style="font-size:32px;font-weight:700">${payload.result.overall}</div></div></div></div>
+          <div class="card"><h3>Criteria</h3><ul>${payload.result.byCriterion.map(c=>`<li><b>${escapeHTML(c.label)}</b> — ${c.score.toFixed(1)}/5<br/><small>${escapeHTML(c.rationale)}${c.suggestions?` • Coaching: ${escapeHTML(c.suggestions)}`:''}</small></li>`).join('')}</ul></div>
+          ${payload.result.suggestedRewrite ? `<div class="card"><h3>Suggested rewrite</h3><pre>${escapeHTML(payload.result.suggestedRewrite)}</pre></div>` : ''}
+          ${payload.managerNotes ? `<div class="card"><h3>Manager notes</h3><p>${escapeHTML(payload.managerNotes)}</p></div>` : ''}
+          <div class="card"><small>Generated at ${payload.generatedAt}</small></div></body></html>`;
+
+          const blob = new Blob([html], { type: "text/html" });
+          const url = URL.createObjectURL(blob); const a = document.createElement("a");
+          a.href = url; a.download = `aihr-eaf-review-${Date.now()}.html`; a.click(); URL.revokeObjectURL(url);
+        }
+
+        // Weight import via SheetJS
+        function onImportWeights(file) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            try {
+              const wb = XLSX.read(reader.result, { type: "array" });
+              let applied = 0; let foundCols = "";
+              wb.SheetNames.forEach(name => {
+                const sheet = wb.Sheets[name];
+                const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+                if (!rows?.length) return;
+                const headers = Object.keys(rows[0]);
+                const critKey = headers.find(h => /criterion|criteria|metric|aspect/i.test(h));
+                const weightKey = headers.find(h => /weight|score weight|points/i.test(h));
+                if (!critKey || !weightKey) return;
+                foundCols = `${name}: ${critKey} / ${weightKey}`;
+                const map = {};
+                for (const row of rows) {
+                  const label = String(row[critKey] || "").trim();
+                  const w = Number(row[weightKey]);
+                  if (!label || isNaN(w)) continue;
+                  map[label.toLowerCase()] = w;
+                }
+                setWeights(prev => {
+                  const next = { ...prev };
+                  for (const c of criteria) {
+                    const exact = map[c.label.toLowerCase()];
+                    if (typeof exact === "number") { next[c.label] = exact; applied++; continue; }
+                    const key = c.label.replace(/[^a-z0-9]/gi, "").toLowerCase();
+                    const hit = Object.entries(map).find(([k]) => k.replace(/[^a-z0-9]/gi, "") === key);
+                    if (hit) { next[c.label] = hit[1]; applied++; }
+                  }
+                  return next;
+                });
+              });
+              setImportMessage(applied ? `Imported ${applied} weight(s) from ${foundCols || "workbook"}.` : "No matching columns were found.");
+            } catch (err) {
+              setImportMessage(`Import failed: ${err?.message || err}`);
+            }
+          };
+          reader.readAsArrayBuffer(file);
+        }
+
+        // Internal tests
+        function runInternalTests() {
+          const results = [];
+          try {
+            const t = cleanTranscript(['From: A','Subject: X','> quoted','Hello','','Kind regards,','Name'].join('\\n'));
+            if (!t.includes('From:') && !t.includes('> quoted') && t.includes('Hello')) results.push('✓ cleanTranscript removes headers/quoted lines');
+            else results.push('✗ cleanTranscript filtering failed');
+          } catch (e) { results.push('✗ cleanTranscript threw: ' + e.message); }
+          try {
+            const row = ['a','b"c'];
+            const csv = [row].map(r => r.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\\n");
+            if (csv.includes("\\n") && csv.includes('"b""c"')) results.push('✓ CSV escaping & newline OK');
+            else results.push('✗ CSV escaping/newline failed');
+          } catch (e) { results.push('✗ CSV test threw: ' + e.message); }
+          try {
+            const payload = { a: 1, b: 'x' };
+            const enc = encodeURIComponent(btoa(JSON.stringify(payload)));
+            const dec = JSON.parse(atob(decodeURIComponent(enc)));
+            if (dec.a === 1 && dec.b === 'x') results.push('✓ Share link b64 roundtrip');
+            else results.push('✗ Share link roundtrip mismatch');
+          } catch (e) { results.push('✗ Share link test threw: ' + e.message); }
+          try {
+            const payload = { msg: 'hello — café ☕' };
+            const enc = encodeURIComponent(btoa(unescape(encodeURIComponent(JSON.stringify(payload)))));
+            const dec = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(enc)))));
+            if (dec.msg === 'hello — café ☕') results.push('✓ Share link b64 roundtrip (Unicode)');
+            else results.push('✗ Share link Unicode mismatch');
+          } catch (e) { results.push('✗ Share link Unicode test threw: ' + e.message); }
+          try {
+            const t2 = cleanTranscript('line1\\n\\n\\nline2');
+            if (t2.includes('line1\\n\\nline2')) results.push('✓ Triple newlines collapse');
+            else results.push('✗ Newline collapse failed');
+          } catch (e) { results.push('✗ Newline collapse test threw: ' + e.message); }
+          return results;
+        }
+
+        // Load from hash payload on mount
+        useEffect(() => {
+          const m = window.location.hash.match(/payload=([^&]+)/);
+          if (!m) return;
+          try {
+            const obj = JSON.parse(b64dec(decodeURIComponent(m[1])));
+            setResult(obj.result || null);
+            setManagerNotes(obj.managerNotes || "");
+            setReviewType(obj.reviewType || "Support");
+            setReviewerId(obj.reviewerId || "");
+            if (obj.link) setLink(obj.link);
+          } catch {}
+        }, []);
+
+        return (
+          <div className="min-h-screen">
+            <header className="max-w-5xl mx-auto px-6 pt-10 pb-4">
+              <h1 className="text-3xl font-bold tracking-tight">AIHR EAF Chat Review</h1>
+              <p className="text-sm text-slate-600 mt-1">Paste a Help&nbsp;Scout link or the full conversation text. Choose Support or Admissions and run an AI review against the EAF rubric.</p>
+            </header>
+
+            <main className="max-w-5xl mx-auto px-6 grid xl:grid-cols-5 gap-6 pb-16">
+              <div className="xl:col-span-3 space-y-6">
+                <div className="card p-5">
+                  <h2 className="text-lg font-semibold mb-3">Conversation Input</h2>
+                  <div className="flex flex-wrap items-center gap-3 mb-3">
+                    <label className="text-sm">Review type</label>
+                    <select value={reviewType} onChange={e => setReviewType(e.target.value)} className="border rounded-xl px-3 py-2 text-sm">
+                      <option>Support</option><option>Admissions</option>
+                    </select>
+                    <span className="inline-flex items-center rounded-full px-3 py-1 text-xs bg-slate-100 border border-slate-200">Total criteria: {criteria.length}</span>
+                  </div>
+                  <input value={link} onChange={e=>setLink(e.target.value)} placeholder="Paste conversation link (optional)" className="w-full border rounded-xl px-3 py-2 text-sm mb-3"/>
+                  <textarea value={text} onChange={e=>setText(e.target.value)} placeholder="…or paste the full conversation transcript here" rows={10} className="w-full border rounded-2xl px-3 py-2 text-sm"></textarea>
+                  <div className="flex items-center justify-between mt-4 gap-3 flex-wrap">
+                    <div className="text-xs text-slate-500">We never auto-send data—content is only processed when you click <b>Run AI Review</b>.</div>
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => setText(t => cleanTranscript(t))} className="rounded-xl px-3 py-2 border text-sm">Clean transcript</button>
+                      <button onClick={runReview} disabled={loading || (!text && !link)} className="rounded-2xl px-4 py-2 bg-indigo-600 text-white disabled:opacity-50 shadow">
+                        {loading ? "Reviewing…" : "Run AI Review"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card p-5">
+                  <h2 className="text-lg font-semibold mb-3">Manager Notes (optional)</h2>
+                  <textarea value={managerNotes} onChange={e=>setManagerNotes(e.target.value)} rows={5} className="w-full border rounded-2xl px-3 py-2 text-sm" placeholder="Add context, overrides, or coaching notes here."></textarea>
+                  <div className="mt-3 flex gap-2 flex-wrap">
+                    <button onClick={exportJSON} disabled={!result} className="rounded-xl px-4 py-2 bg-slate-900 text-white disabled:opacity-30">Export JSON</button>
+                    <button onClick={exportCSV} disabled={!result} className="rounded-xl px-4 py-2 border disabled:opacity-30">Export CSV</button>
+                    <button onClick={exportHTML} disabled={!result} className="rounded-xl px-4 py-2 border disabled:opacity-30">Export HTML (share)</button>
+                    <button onClick={makeShareLink} disabled={!result} className="rounded-xl px-4 py-2 border disabled:opacity-30">Copy Share Link</button>
+                    <button onClick={openShareLink} disabled={!result} className="rounded-xl px-4 py-2 border disabled:opacity-30">Open Share Link</button>
+                    <button onClick={()=>{navigator.clipboard.writeText(managerNotes || "")}} className="rounded-xl px-4 py-2 border">Copy Notes</button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="xl:col-span-2 space-y-6">
+                <div className="card p-5">
+                  <h2 className="text-lg font-semibold mb-3">Rubric & Weights</h2>
+                  <div className="space-y-3">
+                    {criteria.map(c => (
+                      <div key={c.label} className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">{c.label}</div>
+                          <div className="text-xs text-slate-600">{c.description}</div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <label className="text-xs">Weight</label>
+                          <input type="number" min="0" step="0.5" value={weights[c.label] ?? c.weight} onChange={e=>setWeights(w=>({ ...w, [c.label]: Number(e.target.value) }))} className="w-20 border rounded-lg px-2 py-1 text-sm"/>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 text-xs text-slate-500">Total weight (for reference): {totalWeight}</div>
+                  <div className="mt-4 flex items-center gap-2">
+                    <input id="upload" type="file" accept=".xlsx,.csv" className="hidden" onChange={e=> e.target.files && onImportWeights(e.target.files[0])}/>
+                    <label htmlFor="upload" className="cursor-pointer rounded-xl px-3 py-2 border text-sm">Import weights (.xlsx / .csv)</label>
+                    {importMessage && <span className="text-xs text-slate-600">{importMessage}</span>}
+                  </div>
+                </div>
+
+                <div className="card p-5">
+                  <h2 className="text-lg font-semibold mb-3">Settings & Calibration</h2>
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                    <label className="text-sm">Use API (serverless)</label>
+                    <input type="checkbox" checked={useApi} onChange={e=>setUseApi(e.target.checked)} />
+                  </div>
+                  <div className="text-xs text-slate-600 mb-2">When enabled, the app POSTs to your endpoint and uses real LLM grading. If the API fails, it automatically falls back to the local mock.</div>
+                  <div className="flex items-center gap-2 mb-4">
+                    <label className="text-sm">API path</label>
+                    <input className="flex-1 border rounded-xl px-3 py-2 text-sm" value={apiPath} onChange={e=>setApiPath(e.target.value)} />
+                  </div>
+                  <div className="flex items-center gap-2 mb-4">
+                    <label className="text-sm">Share base URL</label>
+                    <input className="flex-1 border rounded-xl px-3 py-2 text-sm" placeholder="e.g., https://reviews.aihr.com/eaf" value={shareBase} onChange={e=>setShareBase(e.target.value)} />
+                  </div>
+
+                  <div className="border-t pt-4 mt-4">
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <label className="text-sm">Calibration mode</label>
+                      <input type="checkbox" checked={calibration} onChange={e=>setCalibration(e.target.checked)} />
+                    </div>
+                    {calibration && (
+                      <div className="space-y-3">
+                        <div className="flex items-center gap-2">
+                          <label className="text-sm">Reviewer ID</label>
+                          <input className="flex-1 border rounded-xl px-3 py-2 text-sm" value={reviewerId} onChange={e=>setReviewerId(e.target.value)} placeholder="e.g., EM/GM/Initials"/>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input id="peer" type="file" accept="application/json" className="hidden" onChange={e=> e.target.files && (function(file){ const reader=new FileReader(); reader.onload=()=>{ try{ const obj = JSON.parse(String(reader.result)); setPeerResult(obj.result); } catch{ alert('Invalid JSON'); } }; reader.readAsText(file); })(e.target.files[0])}/>
+                          <label htmlFor="peer" className="cursor-pointer rounded-xl px-3 py-2 border text-sm">Import peer review (.json)</label>
+                          {peerResult && <span className="inline-flex items-center rounded-full px-3 py-1 text-xs bg-slate-100 border border-slate-200">Peer loaded</span>}
+                        </div>
+                        {peerResult && result && (
+                          <div className="border rounded-xl p-3 bg-slate-50">
+                            <div className="font-medium text-sm mb-1">Reviewer deltas (absolute)</div>
+                            <ul className="list-disc pl-5 text-sm">
+                              {calibrationDiff.map((d,i)=> (<li key={i}><b>{d.label}:</b> mine {d.mine ?? "–"} vs peer {d.theirs ?? "–"} → Δ {d.delta?.toFixed(1) ?? "–"}</li>))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-4">
+                    <button onClick={()=>setTestOutput(runInternalTests())} className="rounded-xl px-3 py-2 border text-sm">Run internal tests</button>
+                    {testOutput && (
+                      <ul className="list-disc pl-5 text-sm mt-2">
+                        {testOutput.map((t,i)=>(<li key={i}>{t}</li>))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+
+                <div className="card p-5">
+                  <h2 className="text-lg font-semibold mb-3">Results</h2>
+                  {!result && <div className="text-sm text-slate-500">Run a review to see AI feedback. Scores are 0–100 overall, with 0–5 per criterion.</div>}
+                  {result && (
+                    <div className="space-y-3">
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-sm text-slate-600">Overall</div>
+                          <div className="text-3xl font-bold">{result.overall}</div>
+                        </div>
+                        <div className="flex gap-2 items-center">
+                          <span className="inline-flex items-center rounded-full px-3 py-1 text-xs bg-slate-100 border border-slate-200">{reviewType}</span>
+                          {reviewerId && <span className="inline-flex items-center rounded-full px-3 py-1 text-xs bg-slate-100 border border-slate-200">Reviewer: {reviewerId}</span>}
+                        </div>
+                      </div>
+                      <div className="h-48">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={result.byCriterion.map(c=>({ name: c.label, score: c.score }))}>
+                            <XAxis dataKey="name" hide/>
+                            <YAxis domain={[0,5]}/>
+                            <Tooltip/>
+                            <Bar dataKey="score" radius={[8,8,0,0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div className="space-y-3">
+                        {result.byCriterion.map(c => (
+                          <div key={c.label} className="border rounded-xl p-3">
+                            <div className="flex items-center justify-between">
+                              <div className="font-medium text-sm">{c.label}</div>
+                              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs bg-slate-100 border border-slate-200">{c.score.toFixed(1)}/5</span>
+                            </div>
+                            <div className="text-sm mt-1">{c.rationale}</div>
+                            {c.suggestions && <div className="text-sm mt-1 text-slate-700"><b>Coaching tip:</b> {c.suggestions}</div>}
+                          </div>
+                        ))}
+                      </div>
+                      {result.suggestedRewrite && (
+                        <div className="border rounded-xl p-3 bg-slate-50">
+                          <div className="font-medium text-sm mb-1">Suggested rewrite</div>
+                          <pre className="whitespace-pre-wrap text-sm">{result.suggestedRewrite}</pre>
+                        </div>
+                      )}
+                      {result.risks && result.risks.length > 0 && (
+                        <div className="border rounded-xl p-3">
+                          <div className="font-medium text-sm mb-1">Risks / Compliance notes</div>
+                          <ul className="list-disc pl-5 text-sm">
+                            {result.risks.map((r, i) => <li key={i}>{r}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </main>
+
+            <footer className="text-center text-xs text-slate-500 py-6">
+              Static site • EAF rubric configurable • API fallback • CSV/HTML export • Share link • Calibration • Transcript cleaner.
+            </footer>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+    </script>
+  </body>
+</html>
