@@ -1,1 +1,4 @@
-CNAME
+Type:   CNAME
+Name:   eaf
+Target: georgemaclean-a11y.github.io
+TTL:    Auto / default
